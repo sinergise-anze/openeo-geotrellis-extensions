@@ -18,6 +18,7 @@ import geotrellis.vector.{Extent, ProjectedExtent}
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.Path
 import org.apache.spark.SparkContext
+import org.apache.spark.rdd.RDD
 import software.amazon.awssdk.services.s3.model.ListObjectsRequest
 
 import scala.collection.JavaConverters.collectionAsScalaIterableConverter
@@ -99,11 +100,6 @@ class PyramidFactory private (rasterSources: => Seq[(RasterSource, ZonedDateTime
   }
 
   def pyramid(boundingBox: ProjectedExtent, from: ZonedDateTime, to: ZonedDateTime)(implicit sc: SparkContext): Pyramid[SpaceTimeKey, MultibandTile, TileLayerMetadata[SpaceTimeKey]] = {
-    val layers = for (zoom <- maxZoom to 0 by -1) yield zoom -> layer(boundingBox, from, to, zoom)
-    Pyramid(layers.toMap)
-  }
-
-  def layer(boundingBox: ProjectedExtent, from: ZonedDateTime, to: ZonedDateTime, zoom: Int = maxZoom)(implicit sc: SparkContext): MultibandTileLayerRDD[SpaceTimeKey] = {
     val reprojectedBoundingBox = ProjectedExtent(boundingBox.reproject(targetCrs), targetCrs)
 
     val overlappingRasterSources = reprojectedRasterSources
@@ -118,31 +114,37 @@ class PyramidFactory private (rasterSources: => Seq[(RasterSource, ZonedDateTime
         overlaps && withinDateRange
       }
 
-    val layout = ZoomedLayoutScheme(targetCrs).levelForZoom(zoom).layout
+    val date = this.date
+    val keyExtractor = TemporalKeyExtractor.fromPath { case GeoTiffPath(value) => deriveDate(value, date) }
 
+    val (rasterSources, _) = overlappingRasterSources.unzip
+    val sources = sc.parallelize(rasterSources).cache()
+    val summary = RasterSummary.fromRDD(sources, keyExtractor.getMetadata)
+
+    val layers = for (zoom <- maxZoom to 0 by -1) yield zoom -> layer(sources, summary, keyExtractor, zoom)
+    Pyramid(layers.toMap)
+  }
+
+  private def layer(sources: RDD[RasterSource], summary: RasterSummary[ZonedDateTime], keyExtractor: KeyExtractor.Aux[SpaceTimeKey, ZonedDateTime], zoom: Int)(implicit sc: SparkContext): MultibandTileLayerRDD[SpaceTimeKey] = {
+    val layout = ZoomedLayoutScheme(targetCrs).levelForZoom(zoom).layout
+    val layerMetadata = summary.toTileLayerMetadata(layout, keyExtractor.getKey)
+
+    /*
+    TODO: supply our own RasterSummary for great justice? (use bounds)
     val bounds = {
       val spatialBounds = layout.mapTransform.extentToBounds(reprojectedBoundingBox.extent)
       val KeyBounds(SpatialKey(minCol, minRow), SpatialKey(maxCol, maxRow)) = KeyBounds(spatialBounds)
       KeyBounds(SpaceTimeKey(minCol, minRow, from), SpaceTimeKey(maxCol, maxRow, to))
     }
+    */
 
-    val (rasterSources, _) = overlappingRasterSources.unzip
-    rasterSourceRDD(rasterSources, layout, bounds)
+    RasterSourceRDD.tiledLayerRDD(sources, layout, keyExtractor, rasterSummary = Some(summary), partitioner = Some(SpacePartitioner(layerMetadata.bounds)))
   }
 
-  private def rasterSourceRDD(
-    rasterSources: Seq[RasterSource],
-    layout: LayoutDefinition,
-    bounds: KeyBounds[SpaceTimeKey]
-  )(implicit sc: SparkContext): MultibandTileLayerRDD[SpaceTimeKey] = {
-    val date = this.date
-    val keyExtractor = TemporalKeyExtractor.fromPath { case GeoTiffPath(value) => deriveDate(value, date) }
+  def layer(boundingBox: ProjectedExtent, from: ZonedDateTime, to: ZonedDateTime, zoom: Int = maxZoom)(implicit sc: SparkContext): MultibandTileLayerRDD[SpaceTimeKey] = {
+    require(zoom >= 0)
+    require(zoom <= maxZoom)
 
-    val sources = sc.parallelize(rasterSources).cache()
-    val summary = RasterSummary.fromRDD(sources, keyExtractor.getMetadata)
-    val layerMetadata = summary.toTileLayerMetadata(layout, keyExtractor.getKey)
-
-    // FIXME: supply our own RasterSummary? (use bounds)
-    RasterSourceRDD.tiledLayerRDD(sources, layout, keyExtractor, partitioner = Some(SpacePartitioner(layerMetadata.bounds)))
+    pyramid(boundingBox, from, to).level(zoom)
   }
 }
